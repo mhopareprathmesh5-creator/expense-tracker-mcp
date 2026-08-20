@@ -90,10 +90,10 @@ mcp = FastMCP(
     lifespan=lifespan,
     instructions=(
         "Tracks personal expenses in a Postgres database.\n\n"
-        "Categories are a fixed taxonomy. Read the `expenses://categories` "
-        "resource to see valid category/subcategory pairs before logging an "
-        "expense; do not invent new ones. If a tool rejects a category it "
-        "returns the valid values in the error.\n\n"
+        "Categories are a fixed taxonomy. Call `list_categories` to see valid "
+        "category/subcategory pairs before logging an expense; do not invent "
+        "new ones. If a tool rejects a category it returns the valid values "
+        "in the error, so you can correct and retry without asking the user.\n\n"
         "Amounts are returned as decimal strings, not numbers, to preserve "
         "exact cents. `add_expense` needs the date the money was spent in "
         "YYYY-MM-DD form -- pass the user's local date rather than assuming "
@@ -239,6 +239,21 @@ def _date_filters(
 # --------------------------------------------------------------------------
 # Tools
 # --------------------------------------------------------------------------
+
+
+@mcp.tool
+def list_categories() -> dict[str, Any]:
+    """List every valid category and its subcategories.
+
+    Call this before logging an expense if you are unsure which category a
+    purchase belongs to. Categories are a fixed taxonomy; anything outside it
+    is rejected.
+    """
+    return {
+        "ok": True,
+        "categories": CATEGORIES,
+        "count": len(CATEGORIES),
+    }
 
 
 @mcp.tool
@@ -417,8 +432,13 @@ async def summarize(
 def categories() -> dict[str, list[str]]:
     """The full category taxonomy: every category and its subcategories.
 
-    Exposed so a client can read the valid values up front rather than
-    discovering them from rejected writes.
+    Deliberately duplicates the `list_categories` tool. Resources are the
+    correct MCP primitive for read-only reference data, but a client only
+    reads one when a *user* attaches it -- models are handed tools, not
+    resources. Testing against Claude showed exactly that: it reported the
+    taxonomy as unavailable and proposed writing a junk row to discover the
+    valid values from the rejection. The tool is what the model can actually
+    reach; this stays for clients that browse resources directly.
     """
     return CATEGORIES
 

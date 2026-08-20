@@ -30,13 +30,19 @@ next step.
 
 | Tool | Purpose |
 |---|---|
+| `list_categories` | The valid taxonomy, so the model can look it up instead of guessing. |
 | `add_expense` | Record one expense. Validates the category before writing. |
 | `list_expenses` | Individual rows, newest first. Optional date range and category filters. |
 | `summarize` | Totals over a date range, grouped by category — or by subcategory when you filter to one category. |
 
-Plus one resource, `expenses://categories`, exposing the full taxonomy so a
-client can read the valid values up front instead of discovering them from
-rejected writes.
+The taxonomy is also published as a resource, `expenses://categories`. That
+duplication is deliberate, and testing against Claude is what put it there:
+resources are the *correct* MCP primitive for read-only reference data, but a
+client only reads one when a **user** attaches it — models are handed tools,
+not resources. Asked "what categories can I use?", Claude reported the
+taxonomy as unavailable and offered to write a junk row so it could read the
+valid values off the rejection error. The tool is what the model can actually
+reach; the resource remains for clients that browse resources directly.
 
 Categories are a fixed two-level taxonomy defined in
 [`categories.json`](categories.json) — 20 categories, each with subcategories.
