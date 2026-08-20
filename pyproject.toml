@@ -1,0 +1,14 @@
+[project]
+name = "expense-tracker-mcp"
+version = "0.1.0"
+description = "Remote MCP server for expense tracking, backed by Neon Postgres"
+readme = "README.md"
+authors = [
+    { name = "Prathmesh Mhopare", email = "mhopareprathmesh5@gmail.com" }
+]
+requires-python = ">=3.10"
+dependencies = [
+    "asyncpg>=0.31.0",
+    "fastmcp>=3.4.7",
+    "python-dotenv>=1.2.2",
+]

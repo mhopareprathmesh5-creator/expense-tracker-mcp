@@ -1,0 +1,22 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# Private working notes. Kept local on purpose: the design decisions a reader
+# actually needs are in README.md, and this file is scratch context for me.
+CLAUDE.md
+
+# Secrets - NEVER commit these.
+# .env holds the Neon connection string, which contains a live password.
+# .env.example is committed on purpose: it documents the required variables
+# without containing any real values.
+.env
+.env.*
+!.env.example
