@@ -447,8 +447,17 @@ if __name__ == "__main__":
     # Local development only. On Horizon the entrypoint is `main.py:mcp` and
     # the platform owns the transport, so this block never runs there.
     #
+    # Defaults to stdio because that is what an MCP client spawning this file
+    # as a subprocess expects: JSON-RPC over stdin/stdout. Pass `http` to
+    # serve over HTTP instead, for the Inspector or curl.
+    #
     # Note 0.0.0.0 is a bind-all wildcard, not an address you can browse to --
     # open http://localhost:8000/mcp. A browser GET on that path returns
     # 406 Not Acceptable, which is correct: MCP needs POST with
-    # `Accept: application/json, text/event-stream`. Use the Inspector.
-    mcp.run(transport="http", host="127.0.0.1", port=8000)
+    # `Accept: application/json, text/event-stream`.
+    if len(sys.argv) > 1 and sys.argv[1] == "http":
+        mcp.run(transport="http", host="127.0.0.1", port=8000)
+    else:
+        # No banner over stdio: a client spawns this as a subprocess and the
+        # banner is pure noise in the client's terminal.
+        mcp.run(transport="stdio", show_banner=False)

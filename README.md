@@ -18,13 +18,14 @@ LangGraph agent ────┘        (FastMCP)
 
 | Phase | | |
 |---|---|---|
-| 1 | Server foundation — typed tools, Postgres, category validation | **works locally** |
-| 2 | LangGraph client — terminal, `create_react_agent`, checkpointed memory | not started |
+| 1 | Server foundation — typed tools, Postgres, category validation | **done** |
+| 2 | LangGraph client — terminal, agent loop, checkpointed memory | **done** |
 | 3 | Streamlit frontend on top of the working agent | not started |
 | 4 | OAuth 2.1, queries scoped to the authenticated user | not started |
 
-Phase 1 is verified end to end against a real Neon database. Deployment is the
-next step.
+The server is deployed and driven by both clients. Every claim above was
+verified by checking what actually landed in Postgres, not by reading what the
+model said it did.
 
 ## Tools
 
@@ -48,6 +49,59 @@ Categories are a fixed two-level taxonomy defined in
 [`categories.json`](categories.json) — 20 categories, each with subcategories.
 Anything outside it is rejected with the valid values included in the error, so
 the model can correct itself in one round trip.
+
+## The terminal client
+
+[`client.py`](client.py) is the second consumer — a LangGraph agent you talk to
+in plain language:
+
+```
+you> log 250 on petrol today
+  → list_categories()
+  ← 20 categories
+  → add_expense(date='2026-08-21', amount=250, category='transport', subcategory='fuel')
+  ← saved #15 250.00 transport/fuel on 2026-08-21
+
+Logged: ₹250.00 for fuel (transport) on 2026-08-21.
+```
+
+Nothing in the taxonomy says "petrol", so the agent looks the categories up
+before writing rather than guessing.
+
+```bash
+uv sync --group client
+
+uv run --group client python client.py            # against a local server
+uv run --group client python client.py --remote   # against the deployed one
+```
+
+The client's dependencies live in a **separate group**. The deployment
+installs the project on every build and has no use for LangGraph, so keeping
+them out of the main list keeps the server's build lean.
+
+Three things it does that a naive chat loop does not:
+
+**A real agent loop.** *"Log 90 on coffee yesterday and then tell me my food
+total"* needs two sequential tool calls in one turn. `create_agent` keeps
+calling tools until the model stops asking for them; a single-round loop
+answers half the question.
+
+**One event loop, one MCP session, for the whole process.** An MCP session is
+bound to the event loop it was created on. Calling `asyncio.run()` per message
+— which is the obvious way to bolt async onto a REPL, and what the earlier
+version of this project did — creates and destroys a loop each time, so the
+second message dies with `Event loop is closed`. Here everything runs inside a
+single `asyncio.run()` with the session held open.
+
+**Conversation memory that survives restarts.** A LangGraph checkpointer keyed
+by `thread_id`, stored in the same Neon database. Quit the client, start it
+again, and ask what you said earlier — it knows, because the history is in
+Postgres rather than in a list in memory.
+
+The system prompt also injects today's local date, because `add_expense`
+deliberately refuses to infer it: the server's clock is UTC and would log the
+wrong day either side of midnight. The client knows the user's date; the
+server does not.
 
 ## Running it locally
 
@@ -82,8 +136,12 @@ Editor or any Postgres client. Every statement is idempotent.
 **Start the server:**
 
 ```bash
-uv run python main.py            # http://127.0.0.1:8000/mcp
+uv run python main.py            # stdio, for a client that spawns it
+uv run python main.py http       # http://127.0.0.1:8000/mcp
 ```
+
+stdio is the default because that is what an MCP client spawning this file as
+a subprocess expects — JSON-RPC over stdin/stdout.
 
 **Or explore it interactively** with the MCP Inspector (needs Node):
 
@@ -142,25 +200,56 @@ anyone's expenses just by asking.
 **Logging goes to stderr.** Over the stdio transport, stdout *is* the JSON-RPC
 channel, and a stray `print()` corrupts the protocol stream.
 
+**One connection string, two drivers that disagree about it.** `DATABASE_URL`
+feeds asyncpg on the server and psycopg in the client's checkpointer. asyncpg
+rejects libpq query parameters outright; psycopg is built on libpq and wants
+them. So the server strips `sslmode` and passes `ssl="require"` in code, while
+the client adds `sslmode=require` back. Both directions are commented, because
+the natural assumption — that one DSN works everywhere — is wrong.
+
+**The checkpointer disables prepared statements.** Neon's pooled endpoint is
+PgBouncer in transaction mode, which hands a different backend to each
+transaction, so a statement prepared on one connection is missing on the next.
+`prepare_threshold=None` avoids it. Left on, this fails *intermittently* after
+appearing to work, which is a much worse failure than one that shows up
+immediately.
+
+**The client sets a selector event loop on Windows.** psycopg's async mode
+refuses to run on `ProactorEventLoop`, the Windows default; asyncio
+subprocesses on Windows run *only* on `ProactorEventLoop`. A stdio MCP
+connection spawns the server as a subprocess, so a stdio transport and an
+async Postgres checkpointer cannot share one loop. The client talks HTTP
+instead — which is what the deployed setup needs anyway. Neither restriction
+exists on Linux or macOS.
+
 ## Not implemented yet
 
 Honest limitations rather than oversights:
 
 - **No edit or delete tools.** Correcting a mis-logged expense means going to
   the database directly. Deferred until it proves annoying in practice.
-- **No currency column.** Every amount is assumed to be in one currency.
+- **No currency column.** Every amount is assumed to be in one currency; the
+  client is told they are rupees.
 - **No authentication.** Every expense is written as `user_id = 'default'`, so
-  the deployed server is single-tenant until phase 4.
+  the deployed server is single-tenant until phase 4. Horizon's own auth gates
+  *who can reach* the server, which is a different question from *whose
+  expenses these are* — two people connecting today would share one ledger.
+- **No long-term memory.** The agent remembers a conversation, not facts across
+  conversations. Those are genuinely different features and only the first is
+  built.
 
 ## Layout
 
 ```
-main.py           the server: three tools, one resource
+main.py           the server: four tools, one resource
+client.py         the terminal agent: LangGraph, Gemini, checkpointed memory
 schema.sql        one-time table + index creation
 categories.json   the category taxonomy, single source of truth
-.env.example      documents DATABASE_URL
+.env.example      documents every variable both halves need
 ```
 
 ## Built with
 
-[FastMCP 3](https://gofastmcp.com) · [asyncpg](https://github.com/MagicStack/asyncpg) · [Neon Postgres](https://neon.tech)
+**Server:** [FastMCP 3](https://gofastmcp.com) · [asyncpg](https://github.com/MagicStack/asyncpg) · [Neon Postgres](https://neon.tech) · [Prefect Horizon](https://horizon.prefect.io)
+
+**Client:** [LangGraph](https://langchain-ai.github.io/langgraph/) · [langchain-mcp-adapters](https://github.com/langchain-ai/langchain-mcp-adapters) · [Gemini](https://ai.google.dev)
