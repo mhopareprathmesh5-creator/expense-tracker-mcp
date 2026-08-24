@@ -9,9 +9,12 @@ spend on food this month?" — and get the same answer from either client,
 because the state lives in a database rather than in a chat session.
 
 ```
-Claude (connector) ─┐
-                    ├─► expense-tracker-mcp ─► Neon Postgres
-LangGraph agent ────┘        (FastMCP)
+Claude (connector) ──┐
+                     │
+Streamlit UI ──┐     ├─► expense-tracker-mcp ─► Neon Postgres
+               ├─────┘        (FastMCP)
+Terminal REPL ─┘
+   (one LangGraph agent, two front-ends)
 ```
 
 ## Status
@@ -20,7 +23,7 @@ LangGraph agent ────┘        (FastMCP)
 |---|---|---|
 | 1 | Server foundation — typed tools, Postgres, category validation | **done** |
 | 2 | LangGraph client — terminal, agent loop, checkpointed memory | **done** |
-| 3 | Streamlit frontend on top of the working agent | not started |
+| 3 | Streamlit frontend on top of the working agent | **done** |
 | 4 | OAuth 2.1, queries scoped to the authenticated user | not started |
 
 The server is deployed and driven by both clients. Every claim above was
@@ -102,6 +105,34 @@ The system prompt also injects today's local date, because `add_expense`
 deliberately refuses to infer it: the server's clock is UTC and would log the
 wrong day either side of midnight. The client knows the user's date; the
 server does not.
+
+## The web UI
+
+[`app.py`](app.py) is a Streamlit chat interface over the same agent — same
+prompt, same tools, same conversation memory, because both front-ends build
+their runtime from [`agent.py`](agent.py) rather than each assembling one.
+
+```bash
+uv run --group ui streamlit run app.py
+```
+
+Tool calls are shown under each answer, so you can watch the agent look up a
+category, get a rejection, and correct itself.
+
+**Streamlit re-executes the whole script on every interaction**, which is
+hostile to exactly what this app holds: an MCP session and a psycopg
+connection, both bound to the event loop that created them. Rebuilt per rerun
+they would be opened and closed on every keystroke. So the async half lives in
+**one background thread owning one event loop**, built once behind
+`@st.cache_resource`; the script hands coroutines to that loop and waits for
+results. Reruns redraw the page and cannot disturb the connections.
+
+The conversation id lives in the **URL**, not in `st.session_state` — session
+state is wiped by a browser refresh, which would drop you back into the
+default conversation at precisely the moment persistence is supposed to prove
+itself. The sidebar lists every stored conversation, read back from the
+checkpoint tables, so conversations started in the terminal client appear
+there too.
 
 ## Running it locally
 
@@ -242,14 +273,16 @@ Honest limitations rather than oversights:
 
 ```
 main.py           the server: four tools, one resource
-client.py         the terminal agent: LangGraph, Gemini, checkpointed memory
+agent.py          the agent: MCP session, checkpointer, model, prompt
+client.py         terminal front-end
+app.py            Streamlit front-end
 schema.sql        one-time table + index creation
 categories.json   the category taxonomy, single source of truth
-.env.example      documents every variable both halves need
+.env.example      documents every variable all three need
 ```
 
 ## Built with
 
 **Server:** [FastMCP 3](https://gofastmcp.com) · [asyncpg](https://github.com/MagicStack/asyncpg) · [Neon Postgres](https://neon.tech) · [Prefect Horizon](https://horizon.prefect.io)
 
-**Client:** [LangGraph](https://langchain-ai.github.io/langgraph/) · [langchain-mcp-adapters](https://github.com/langchain-ai/langchain-mcp-adapters) · [Gemini](https://ai.google.dev)
+**Client:** [LangGraph](https://langchain-ai.github.io/langgraph/) · [langchain-mcp-adapters](https://github.com/langchain-ai/langchain-mcp-adapters) · [Gemini](https://ai.google.dev) · [Streamlit](https://streamlit.io)
