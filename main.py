@@ -39,6 +39,7 @@ from urllib.parse import urlencode, urlparse, urlunparse, parse_qsl
 import asyncpg
 from dotenv import load_dotenv
 from fastmcp import FastMCP
+from fastmcp.server.dependencies import get_access_token
 from pydantic import Field
 
 # stderr, never stdout: over the stdio transport, stdout *is* the JSON-RPC
@@ -239,6 +240,48 @@ def _date_filters(
 # --------------------------------------------------------------------------
 # Tools
 # --------------------------------------------------------------------------
+
+
+@mcp.tool
+def whoami() -> dict[str, Any]:
+    """Report the identity the server sees for this request.
+
+    Diagnostic for phase 4. Scoping expenses per user requires the server to
+    know *who* is calling, and that depends on what the hosting platform
+    passes through -- which is not something the docs settle. This tool
+    answers it empirically: call it from each client and compare.
+
+    Deliberately never returns the token itself, only whether one exists and
+    what it identifies. The token is a credential; the subject is not.
+    """
+    token = get_access_token()
+    if token is None:
+        return {
+            "ok": True,
+            "authenticated": False,
+            "user_id_would_be": DEFAULT_USER_ID,
+            "note": (
+                "No access token reached the server, so every request looks "
+                "identical and all rows share one user_id."
+            ),
+        }
+
+    return {
+        "ok": True,
+        "authenticated": True,
+        "subject": token.subject,
+        "client_id": token.client_id,
+        "scopes": token.scopes,
+        "resource": token.resource,
+        "claim_keys": sorted(token.claims or {}),
+        "claims": {
+            k: v
+            for k, v in (token.claims or {}).items()
+            # Skip anything long or token-shaped; we want identifiers, not
+            # credentials, in a tool result that gets shown in a chat.
+            if isinstance(v, (str, int, bool)) and len(str(v)) < 120
+        },
+    }
 
 
 @mcp.tool
