@@ -299,15 +299,12 @@ def whoami() -> dict[str, Any]:
     identity_headers = {
         name: (_peek_jwt(value) if name.lower() == "authorization" else value)
         for name, value in headers.items()
-        if name.lower()
-        in {
-            "authorization",
-            "x-forwarded-user",
-            "x-forwarded-email",
-            "x-user-id",
-            "x-auth-request-user",
-            "x-auth-request-email",
-        }
+        if name.lower() == "authorization"
+        or name.lower().startswith(
+            # Horizon's own identity headers, plus the conventional
+            # reverse-proxy ones in case the platform changes its mind.
+            ("horizon-", "fastmcp-cloud-", "x-forwarded-", "x-auth-request-")
+        )
     }
 
     token = get_access_token()
