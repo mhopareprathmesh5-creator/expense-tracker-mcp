@@ -24,6 +24,7 @@ Design notes worth knowing before editing this file:
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import logging
 import os
@@ -39,7 +40,7 @@ from urllib.parse import urlencode, urlparse, urlunparse, parse_qsl
 import asyncpg
 from dotenv import load_dotenv
 from fastmcp import FastMCP
-from fastmcp.server.dependencies import get_access_token
+from fastmcp.server.dependencies import get_access_token, get_http_headers
 from pydantic import Field
 
 # stderr, never stdout: over the stdio transport, stdout *is* the JSON-RPC
@@ -242,6 +243,41 @@ def _date_filters(
 # --------------------------------------------------------------------------
 
 
+def _peek_jwt(header_value: str) -> dict[str, Any]:
+    """Describe an Authorization header without ever revealing the credential.
+
+    If it carries a JWT, the payload is base64 -- readable by anyone, signed
+    rather than encrypted -- so decoding it locally reveals nothing that the
+    holder of the token does not already have. Only identity-ish claims are
+    returned, and the signature is never touched: this is a diagnostic, not
+    verification. Nothing here trusts the contents.
+    """
+    prefix, _, credential = header_value.partition(" ")
+    result: dict[str, Any] = {"scheme": prefix, "length": len(credential)}
+
+    parts = credential.split(".")
+    if len(parts) != 3:
+        result["format"] = "opaque token, not a JWT -- no claims to read"
+        return result
+
+    try:
+        payload = parts[1]
+        payload += "=" * (-len(payload) % 4)  # restore stripped padding
+        claims = json.loads(base64.urlsafe_b64decode(payload))
+    except Exception as exc:
+        result["format"] = f"looked like a JWT but did not decode: {exc}"
+        return result
+
+    result["format"] = "JWT"
+    result["claim_keys"] = sorted(claims)
+    result["identity_claims"] = {
+        k: v
+        for k, v in claims.items()
+        if k in {"sub", "email", "preferred_username", "name", "iss", "aud", "client_id"}
+    }
+    return result
+
+
 @mcp.tool
 def whoami() -> dict[str, Any]:
     """Report the identity the server sees for this request.
@@ -254,15 +290,38 @@ def whoami() -> dict[str, Any]:
     Deliberately never returns the token itself, only whether one exists and
     what it identifies. The token is a credential; the subject is not.
     """
+    # Header names only, plus a peek at any JWT payload. `get_access_token()`
+    # alone cannot answer the question: it returns None whenever the server
+    # has no auth provider configured, which is true here, so it would report
+    # "unauthenticated" even if a perfectly good token were arriving. What
+    # matters is whether identity reaches the request at all.
+    headers = get_http_headers()
+    identity_headers = {
+        name: (_peek_jwt(value) if name.lower() == "authorization" else value)
+        for name, value in headers.items()
+        if name.lower()
+        in {
+            "authorization",
+            "x-forwarded-user",
+            "x-forwarded-email",
+            "x-user-id",
+            "x-auth-request-user",
+            "x-auth-request-email",
+        }
+    }
+
     token = get_access_token()
     if token is None:
         return {
             "ok": True,
             "authenticated": False,
             "user_id_would_be": DEFAULT_USER_ID,
+            "header_names": sorted(headers),
+            "identity_headers": identity_headers,
             "note": (
-                "No access token reached the server, so every request looks "
-                "identical and all rows share one user_id."
+                "FastMCP parsed no token -- expected, since this server has no "
+                "auth provider configured. Look at identity_headers: if a "
+                "subject arrives there, per-user scoping is possible."
             ),
         }
 
