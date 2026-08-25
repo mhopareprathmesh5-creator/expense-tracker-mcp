@@ -154,10 +154,16 @@ with st.sidebar:
     st.caption("A LangGraph agent talking to a remote MCP server.")
 
     st.markdown(
+        f"**Signed in as**  \n`{runtime.email or runtime.user_id}`\n\n"
         f"**Server**  \n`{runtime.url}`\n\n"
         f"**Model**  \n`{MODEL}`\n\n"
         f"**Tools**  \n" + "  \n".join(f"`{t.name}`" for t in runtime.tools)
     )
+    if runtime.user_id == "default":
+        st.warning(
+            "Unauthenticated — expenses go to the shared local bucket.",
+            icon="⚠️",
+        )
 
     # Every stored conversation, read back from the checkpoint tables --
     # including ones started in the terminal client, since both front-ends

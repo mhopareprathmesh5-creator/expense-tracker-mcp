@@ -24,7 +24,7 @@ Terminal REPL ─┘
 | 1 | Server foundation — typed tools, Postgres, category validation | **done** |
 | 2 | LangGraph client — terminal, agent loop, checkpointed memory | **done** |
 | 3 | Streamlit frontend on top of the working agent | **done** |
-| 4 | OAuth 2.1, queries scoped to the authenticated user | not started |
+| 4 | Queries scoped to the authenticated user | **done** |
 
 The server is deployed and driven by both clients. Every claim above was
 verified by checking what actually landed in Postgres, not by reading what the
@@ -34,9 +34,11 @@ model said it did.
 
 | Tool | Purpose |
 |---|---|
+| `whoami` | Which user the server sees, and whether expenses are scoped. |
 | `list_categories` | The valid taxonomy, so the model can look it up instead of guessing. |
 | `add_expense` | Record one expense. Validates the category before writing. |
 | `list_expenses` | Individual rows, newest first. Optional date range and category filters. |
+| `delete_expense` | Remove one expense by id. Scoped to the owner. |
 | `summarize` | Totals over a date range, grouped by category — or by subcategory when you filter to one category. |
 
 The taxonomy is also published as a resource, `expenses://categories`. That
@@ -222,11 +224,26 @@ body runs at all.
 key. A tool that returns a list on success and a dict on error forces every
 caller to type-check before using the result.
 
-**`user_id` exists from day one**, defaulted and currently unused; phase 4
-scopes every query by it. Adding a `NOT NULL` column to a populated table later
-is a migration — adding it now is free. It is deliberately *not* a tool
-parameter: if the model could choose the `user_id`, any client could read
-anyone's expenses just by asking.
+**Every query is scoped to the authenticated user, and there is one place it
+can go wrong.** Prefect Horizon terminates auth at its edge and forwards the
+identity in `horizon-user-id`; the server reads it in `current_user_id()`.
+Reads go through a single helper that always emits `user_id = $1`, so no tool
+builds its own `WHERE` clause and none can forget the filter. `delete_expense`
+scopes in the `DELETE` itself rather than checking ownership first — one
+statement cannot disagree with itself the way a check-then-delete can — and
+returns the same "not in your records" answer whether the id is missing or
+someone else's, so it never confirms that a row exists.
+
+`user_id` was on the table from day one, defaulted and unused, precisely so
+this step would be a change of value rather than a migration. It is
+deliberately *not* a tool parameter: if the model could choose it, any client
+could read anyone's expenses just by asking.
+
+**Header-based identity is only sound if headers cannot be forged**, so that
+was tested rather than assumed: sending `horizon-user-id: 00000000-dead-beef-…`
+from a client, the gateway overwrote it and the server still saw the real
+subject. Had it not, this would be an assertion rather than authentication and
+unusable as a security boundary.
 
 **Logging goes to stderr.** Over the stdio transport, stdout *is* the JSON-RPC
 channel, and a stray `print()` corrupts the protocol stream.
@@ -257,14 +274,15 @@ exists on Linux or macOS.
 
 Honest limitations rather than oversights:
 
-- **No edit or delete tools.** Correcting a mis-logged expense means going to
-  the database directly. Deferred until it proves annoying in practice.
+- **No edit tool.** You can add and delete, but not amend in place; correcting
+  an amount means deleting and re-logging.
 - **No currency column.** Every amount is assumed to be in one currency; the
   client is told they are rupees.
-- **No authentication.** Every expense is written as `user_id = 'default'`, so
-  the deployed server is single-tenant until phase 4. Horizon's own auth gates
-  *who can reach* the server, which is a different question from *whose
-  expenses these are* — two people connecting today would share one ledger.
+- **The web UI is single-user.** The server scopes by authenticated user, but
+  `app.py` holds one API key, so every browser visitor acts as its owner. Real
+  per-user identity applies to people connecting with their own accounts — a
+  Claude connector, or their own key. Making the UI multi-user needs its own
+  login, which is a different piece of work.
 - **No long-term memory.** The agent remembers a conversation, not facts across
   conversations. Those are genuinely different features and only the first is
   built.

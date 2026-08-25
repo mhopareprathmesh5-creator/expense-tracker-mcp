@@ -53,6 +53,7 @@ async def repl(runtime: AgentRuntime) -> None:
     # conversation, because the history lives in Postgres rather than here.
     thread_id = "default"
     print(f"model: {MODEL}   tools: {', '.join(t.name for t in runtime.tools)}")
+    print(f"user:  {runtime.email or runtime.user_id}")
     print(f"memory: Neon Postgres, thread '{thread_id}'")
     print("commands: /new (fresh conversation)  /quit\n")
 

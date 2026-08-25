@@ -202,6 +202,9 @@ def brief(payload: dict) -> str:
             f"saved #{e['id']} {e['amount']} "
             f"{e['category']}/{e['subcategory'] or '-'} on {e['date']}"
         )
+    if "deleted" in payload:
+        e = payload["deleted"]
+        return f"deleted #{e['id']} {e['amount']} {e['category']} on {e['date']}"
     if "expenses" in payload:
         return f"{payload.get('count', 0)} rows"
     if "breakdown" in payload:
@@ -231,8 +234,21 @@ class AgentRuntime:
         self.url = connection(remote)["url"]
         self.agent: Any = None
         self.tools: list = []
+        self.user_id = "default"
+        self.email: str | None = None
         self._stack = AsyncExitStack()
         self._conn: psycopg.AsyncConnection | None = None
+
+    def thread_key(self, name: str) -> str:
+        """Namespace a conversation by its owner.
+
+        Expenses are scoped by the server, but conversation history is stored
+        by this client, so it has to scope itself. Without this the sidebar
+        would list every conversation in the database regardless of who
+        started it -- the expenses would be private and the chat about them
+        would not.
+        """
+        return f"{self.user_id}:{name}"
 
     async def start(self) -> AgentRuntime:
         self._conn = await psycopg.AsyncConnection.connect(
@@ -254,6 +270,15 @@ class AgentRuntime:
         client = MultiServerMCPClient({SERVER_NAME: connection(self.remote)})
         session = await self._stack.enter_async_context(client.session(SERVER_NAME))
         self.tools = await load_mcp_tools(session)
+
+        # Ask the server who it thinks we are, rather than assuming. Against
+        # the deployed server this returns the authenticated identity; locally
+        # it returns "default", and conversations are namespaced accordingly.
+        whoami = next((t for t in self.tools if t.name == "whoami"), None)
+        if whoami is not None:
+            identity = unwrap(await whoami.ainvoke({}))
+            self.user_id = identity.get("user_id", "default")
+            self.email = identity.get("email")
 
         # The agent loop: call the model, run any tools it asks for, feed the
         # results back, repeat until it answers without a tool call. That loop
@@ -278,7 +303,7 @@ class AgentRuntime:
         events rather than printing is what lets the terminal and the browser
         render the same turn differently without duplicating any logic.
         """
-        config = {"configurable": {"thread_id": thread_id}}
+        config = {"configurable": {"thread_id": self.thread_key(thread_id)}}
         async for chunk in self.agent.astream(
             {"messages": [("user", text)]}, config=config, stream_mode="updates"
         ):
@@ -313,11 +338,16 @@ class AgentRuntime:
         """
         if self._conn is None:
             return []
+        prefix = f"{self.user_id}:"
         cursor = await self._conn.execute(
             "SELECT thread_id, max(checkpoint_id::text) AS newest "
-            "FROM checkpoints GROUP BY thread_id ORDER BY newest DESC"
+            "FROM checkpoints WHERE thread_id LIKE %s "
+            "GROUP BY thread_id ORDER BY newest DESC",
+            (prefix + "%",),
         )
-        return [row["thread_id"] for row in await cursor.fetchall()]
+        return [
+            row["thread_id"][len(prefix) :] for row in await cursor.fetchall()
+        ]
 
     async def history(self, thread_id: str) -> list[dict]:
         """Replay a stored conversation from the checkpointer.
@@ -326,7 +356,7 @@ class AgentRuntime:
         process: a browser refresh, or a restart, can rebuild the visible
         conversation instead of starting blank.
         """
-        config = {"configurable": {"thread_id": thread_id}}
+        config = {"configurable": {"thread_id": self.thread_key(thread_id)}}
         snapshot = await self.agent.aget_state(config)
         if not snapshot or not snapshot.values:
             return []

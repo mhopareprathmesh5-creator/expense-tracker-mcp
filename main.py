@@ -24,7 +24,6 @@ Design notes worth knowing before editing this file:
 from __future__ import annotations
 
 import asyncio
-import base64
 import json
 import logging
 import os
@@ -40,7 +39,7 @@ from urllib.parse import urlencode, urlparse, urlunparse, parse_qsl
 import asyncpg
 from dotenv import load_dotenv
 from fastmcp import FastMCP
-from fastmcp.server.dependencies import get_access_token, get_http_headers
+from fastmcp.server.dependencies import get_http_headers
 from pydantic import Field
 
 # stderr, never stdout: over the stdio transport, stdout *is* the JSON-RPC
@@ -62,10 +61,24 @@ CATEGORIES: dict[str, list[str]] = json.loads(
     (HERE / "categories.json").read_text(encoding="utf-8")
 )
 
-# Phase 4 replaces this with the subject of the OAuth token. It is deliberately
-# NOT a tool parameter: if the model could choose the user_id, any client could
-# read any other user's expenses just by asking for them.
+# Used only when no authenticated identity reaches the server -- i.e. running
+# locally with no gateway in front. Deployed, every request carries a real one.
+#
+# `user_id` is deliberately NOT a tool parameter: if the model could choose it,
+# any client could read anyone's expenses just by asking.
 DEFAULT_USER_ID = "default"
+
+# Prefect Horizon terminates authentication at its edge and forwards the
+# authenticated identity in headers. This one carries a stable UUID; there is
+# also `horizon-user-email`, but emails change and user ids do not.
+#
+# Trusting a header is only sound if clients cannot forge it. Verified by
+# sending `horizon-user-id: 00000000-dead-beef-...` from a client: the gateway
+# overwrote it and the server still saw the real subject. Were that not true,
+# this would be an assertion rather than authentication, and unusable as a
+# security boundary.
+IDENTITY_HEADER = "horizon-user-id"
+EMAIL_HEADER = "horizon-user-email"
 
 MAX_LIMIT = 500
 
@@ -99,7 +112,10 @@ mcp = FastMCP(
         "Amounts are returned as decimal strings, not numbers, to preserve "
         "exact cents. `add_expense` needs the date the money was spent in "
         "YYYY-MM-DD form -- pass the user's local date rather than assuming "
-        "the server's."
+        "the server's.\n\n"
+        "`delete_expense` is permanent. Find the id with `list_expenses` and "
+        "confirm which row the user means before deleting; never guess an id "
+        "from a description."
     ),
 )
 
@@ -222,8 +238,12 @@ def _date_filters(
     Parameters are numbered ($1, $2, ...) and passed separately -- never
     interpolated into the SQL string.
     """
+    # Every read starts here, and every read is scoped. There is no code path
+    # that queries expenses without a user_id predicate, which is the property
+    # that makes multi-tenancy hold: forgetting the filter is not possible in
+    # one tool because no tool builds its own WHERE clause.
     clauses = ["user_id = $1"]
-    args: list[Any] = [DEFAULT_USER_ID]
+    args: list[Any] = [current_user_id()]
 
     if start_date is not None:
         args.append(start_date)
@@ -243,100 +263,49 @@ def _date_filters(
 # --------------------------------------------------------------------------
 
 
-def _peek_jwt(header_value: str) -> dict[str, Any]:
-    """Describe an Authorization header without ever revealing the credential.
+def _header(name: str) -> str | None:
+    """Case-insensitive lookup of one request header, if there is a request."""
+    wanted = name.lower()
+    for key, value in get_http_headers().items():
+        if key.lower() == wanted and value.strip():
+            return value.strip()
+    return None
 
-    If it carries a JWT, the payload is base64 -- readable by anyone, signed
-    rather than encrypted -- so decoding it locally reveals nothing that the
-    holder of the token does not already have. Only identity-ish claims are
-    returned, and the signature is never touched: this is a diagnostic, not
-    verification. Nothing here trusts the contents.
+
+def current_user_id() -> str:
+    """Whose expenses this request may touch.
+
+    Every read and every write goes through this. Returning the fallback means
+    the request arrived with no authenticated identity, which happens when the
+    server runs locally with no gateway in front -- fine for development, and
+    single-user by definition.
     """
-    prefix, _, credential = header_value.partition(" ")
-    result: dict[str, Any] = {"scheme": prefix, "length": len(credential)}
-
-    parts = credential.split(".")
-    if len(parts) != 3:
-        result["format"] = "opaque token, not a JWT -- no claims to read"
-        return result
-
-    try:
-        payload = parts[1]
-        payload += "=" * (-len(payload) % 4)  # restore stripped padding
-        claims = json.loads(base64.urlsafe_b64decode(payload))
-    except Exception as exc:
-        result["format"] = f"looked like a JWT but did not decode: {exc}"
-        return result
-
-    result["format"] = "JWT"
-    result["claim_keys"] = sorted(claims)
-    result["identity_claims"] = {
-        k: v
-        for k, v in claims.items()
-        if k in {"sub", "email", "preferred_username", "name", "iss", "aud", "client_id"}
-    }
-    return result
+    return _header(IDENTITY_HEADER) or DEFAULT_USER_ID
 
 
 @mcp.tool
 def whoami() -> dict[str, Any]:
-    """Report the identity the server sees for this request.
+    """Report which user the server sees, and whether expenses are scoped.
 
-    Diagnostic for phase 4. Scoping expenses per user requires the server to
-    know *who* is calling, and that depends on what the hosting platform
-    passes through -- which is not something the docs settle. This tool
-    answers it empirically: call it from each client and compare.
-
-    Deliberately never returns the token itself, only whether one exists and
-    what it identifies. The token is a credential; the subject is not.
+    Worth having permanently rather than as a one-off diagnostic: "why can't I
+    see my expenses?" is answered by this tool in one call, and the answer is
+    almost always that the request arrived unauthenticated and landed in the
+    shared local bucket.
     """
-    # Header names only, plus a peek at any JWT payload. `get_access_token()`
-    # alone cannot answer the question: it returns None whenever the server
-    # has no auth provider configured, which is true here, so it would report
-    # "unauthenticated" even if a perfectly good token were arriving. What
-    # matters is whether identity reaches the request at all.
-    headers = get_http_headers()
-    identity_headers = {
-        name: (_peek_jwt(value) if name.lower() == "authorization" else value)
-        for name, value in headers.items()
-        if name.lower() == "authorization"
-        or name.lower().startswith(
-            # Horizon's own identity headers, plus the conventional
-            # reverse-proxy ones in case the platform changes its mind.
-            ("horizon-", "fastmcp-cloud-", "x-forwarded-", "x-auth-request-")
-        )
-    }
-
-    token = get_access_token()
-    if token is None:
-        return {
-            "ok": True,
-            "authenticated": False,
-            "user_id_would_be": DEFAULT_USER_ID,
-            "header_names": sorted(headers),
-            "identity_headers": identity_headers,
-            "note": (
-                "FastMCP parsed no token -- expected, since this server has no "
-                "auth provider configured. Look at identity_headers: if a "
-                "subject arrives there, per-user scoping is possible."
-            ),
-        }
-
+    user_id = current_user_id()
+    scoped = user_id != DEFAULT_USER_ID
     return {
         "ok": True,
-        "authenticated": True,
-        "subject": token.subject,
-        "client_id": token.client_id,
-        "scopes": token.scopes,
-        "resource": token.resource,
-        "claim_keys": sorted(token.claims or {}),
-        "claims": {
-            k: v
-            for k, v in (token.claims or {}).items()
-            # Skip anything long or token-shaped; we want identifiers, not
-            # credentials, in a tool result that gets shown in a chat.
-            if isinstance(v, (str, int, bool)) and len(str(v)) < 120
-        },
+        "user_id": user_id,
+        "email": _header(EMAIL_HEADER),
+        "scoped": scoped,
+        "note": (
+            "Expenses are scoped to this user; nobody else can read them."
+            if scoped
+            else "No authenticated identity in this request, so expenses go to "
+            "the shared local bucket. Expected when running the server "
+            "locally; unexpected on the deployed server."
+        ),
     }
 
 
@@ -386,6 +355,8 @@ async def add_expense(
     if amt <= 0:
         return {"ok": False, "error": "Amount must be greater than zero."}
 
+    user_id = current_user_id()
+
     pool = await get_pool()
     row = await pool.fetchrow(
         """
@@ -393,7 +364,7 @@ async def add_expense(
         VALUES ($1, $2, $3, $4, $5, $6)
         RETURNING id, date, amount, category, subcategory, note
         """,
-        DEFAULT_USER_ID,
+        user_id,
         date,
         amt,
         cat,
@@ -401,7 +372,7 @@ async def add_expense(
         note.strip(),
     )
 
-    log.info("added expense id=%s %s %s", row["id"], cat, amt)
+    log.info("added expense id=%s user=%s %s %s", row["id"], user_id, cat, amt)
     return {"ok": True, "expense": _row_to_expense(row)}
 
 
@@ -453,6 +424,53 @@ async def list_expenses(
         "count": len(rows),
         "expenses": [_row_to_expense(r) for r in rows],
     }
+
+
+@mcp.tool(
+    # Tells a client this tool destroys data, so it can ask the user before
+    # running it. Idempotent because deleting the same id twice leaves the
+    # same state -- the second call simply reports nothing to delete.
+    annotations={"destructiveHint": True, "idempotentHint": True},
+)
+async def delete_expense(
+    expense_id: Annotated[
+        int, Field(gt=0, description="id of the expense to delete, from list_expenses.")
+    ],
+) -> dict[str, Any]:
+    """Delete one expense, by id.
+
+    Use `list_expenses` first to find the id, and confirm with the user which
+    one they mean before deleting -- ids are not guessable from a description
+    and deleting the wrong row cannot be undone.
+    """
+    user_id = current_user_id()
+
+    # `AND user_id = $2` is the whole security of this tool. Without it, any
+    # user could delete any row by guessing an id -- ids are sequential, so
+    # guessing is trivial. The scoping is in the WHERE clause rather than in a
+    # separate ownership check because a check-then-delete is two statements
+    # that can disagree; this is one.
+    row = await (await get_pool()).fetchrow(
+        """
+        DELETE FROM expenses
+        WHERE id = $1 AND user_id = $2
+        RETURNING id, date, amount, category, subcategory, note
+        """,
+        expense_id,
+        user_id,
+    )
+
+    if row is None:
+        # Deliberately the same answer whether the id never existed or belongs
+        # to somebody else. Saying "that expense is not yours" would confirm
+        # the id exists, which is a small leak but a free one to avoid.
+        return {
+            "ok": False,
+            "error": f"No expense #{expense_id} in your records.",
+        }
+
+    log.info("deleted expense id=%s user=%s", row["id"], user_id)
+    return {"ok": True, "deleted": _row_to_expense(row)}
 
 
 @mcp.tool
