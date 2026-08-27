@@ -70,15 +70,33 @@ def use_selector_event_loop() -> None:
         asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
 
-def connection(remote: bool) -> dict[str, Any]:
+def connection(remote: bool, as_user: str | None = None) -> dict[str, Any]:
     """MCP connection config for either the local or the deployed server.
 
-    Note how little differs between them: a URL and one header. The tools, the
-    agent, the prompt and the memory are identical either way. That is the
-    argument for MCP in one function.
+    `as_user` is for the web UI, which serves many people through one API key.
+    It names whose request this is, and pairs the claim with a shared secret
+    the server checks -- without which any caller could name any user. The
+    terminal client leaves it None and is identified by its own credential.
     """
+    headers: dict[str, str] = {}
+
+    if as_user:
+        secret = os.environ.get("APP_SHARED_SECRET")
+        if not secret:
+            raise RuntimeError(
+                "APP_SHARED_SECRET is not set, so the server would ignore the "
+                "asserted user and put everyone in one ledger. Refusing to "
+                "run rather than silently mixing people's expenses."
+            )
+        headers["x-app-user"] = as_user.strip().lower()
+        headers["x-app-secret"] = secret
+
     if not remote:
-        return {"url": LOCAL_URL, "transport": "streamable_http"}
+        return {
+            "url": LOCAL_URL,
+            "transport": "streamable_http",
+            **({"headers": headers} if headers else {}),
+        }
 
     key = os.environ.get("HORIZON_API_KEY")
     if not key:
@@ -89,7 +107,7 @@ def connection(remote: bool) -> dict[str, Any]:
     return {
         "url": REMOTE_URL,
         "transport": "streamable_http",
-        "headers": {"Authorization": f"Bearer {key}"},
+        "headers": {"Authorization": f"Bearer {key}", **headers},
     }
 
 
@@ -229,13 +247,14 @@ class AgentRuntime:
     nested context managers open without nesting `with` statements.
     """
 
-    def __init__(self, remote: bool = True) -> None:
+    def __init__(self, remote: bool = True, as_user: str | None = None) -> None:
         self.remote = remote
-        self.url = connection(remote)["url"]
+        self.as_user = as_user
+        self.url = REMOTE_URL if remote else LOCAL_URL
         self.agent: Any = None
         self.tools: list = []
         self.user_id = "default"
-        self.email: str | None = None
+        self.identified_by = "unknown"
         self._stack = AsyncExitStack()
         self._conn: psycopg.AsyncConnection | None = None
 
@@ -267,7 +286,9 @@ class AgentRuntime:
         # They sit alongside `expenses`, which is untouched.
         await checkpointer.setup()
 
-        client = MultiServerMCPClient({SERVER_NAME: connection(self.remote)})
+        client = MultiServerMCPClient(
+            {SERVER_NAME: connection(self.remote, self.as_user)}
+        )
         session = await self._stack.enter_async_context(client.session(SERVER_NAME))
         self.tools = await load_mcp_tools(session)
 
@@ -278,7 +299,7 @@ class AgentRuntime:
         if whoami is not None:
             identity = unwrap(await whoami.ainvoke({}))
             self.user_id = identity.get("user_id", "default")
-            self.email = identity.get("email")
+            self.identified_by = identity.get("identified_by", "unknown")
 
         # The agent loop: call the model, run any tools it asks for, feed the
         # results back, repeat until it answers without a tool call. That loop

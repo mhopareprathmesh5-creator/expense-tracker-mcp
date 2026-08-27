@@ -27,6 +27,7 @@ import asyncio
 import json
 import logging
 import os
+import secrets
 import sys
 from contextlib import asynccontextmanager
 from collections.abc import AsyncIterator
@@ -79,6 +80,32 @@ DEFAULT_USER_ID = "default"
 # security boundary.
 IDENTITY_HEADER = "horizon-user-id"
 EMAIL_HEADER = "horizon-user-email"
+
+# Identity is keyed on **email**, not on the Horizon UUID, because two
+# different doors lead to the same person: connecting through Claude gives a
+# Horizon UUID, while signing into the web UI with Google gives a Google
+# subject. Keyed on ids, one human would own two unrelated ledgers. Email is
+# the one identifier both doors produce.
+#
+# The cost, worth being able to state: emails are mutable, so changing yours
+# orphans your history. Fine here; not fine at a bank, where you would keep an
+# immutable id and a separate email column.
+
+# --- the trusted-app path ------------------------------------------------
+#
+# The web UI is one program serving many people, so it authenticates once
+# (its own API key) and then has to say *which* of its users each request is
+# for. `APP_USER_HEADER` carries that claim.
+#
+# A claim is only worth as much as the proof behind it. Without
+# `APP_SECRET_HEADER` matching the shared secret, anyone holding an API key
+# could name any user and read their expenses. With it, the server can tell
+# "my web app said this" from "some caller said this".
+#
+# If the secret is unset, the whole path is disabled rather than open.
+APP_USER_HEADER = "x-app-user"
+APP_SECRET_HEADER = "x-app-secret"
+APP_SHARED_SECRET = os.environ.get("APP_SHARED_SECRET", "")
 
 MAX_LIMIT = 500
 
@@ -272,15 +299,36 @@ def _header(name: str) -> str | None:
     return None
 
 
-def current_user_id() -> str:
-    """Whose expenses this request may touch.
+def identity() -> tuple[str, str]:
+    """Whose expenses this request may touch, and how we know.
 
-    Every read and every write goes through this. Returning the fallback means
-    the request arrived with no authenticated identity, which happens when the
-    server runs locally with no gateway in front -- fine for development, and
-    single-user by definition.
+    Three cases, in order of precedence:
+
+    1. **A trusted app acting for one of its users.** Accepted only when the
+       shared secret matches, so an arbitrary caller cannot name a user.
+    2. **A person authenticated by the gateway**, connecting with their own
+       account -- a Claude connector, or their own API key.
+    3. **Nobody** -- no gateway in front, which means running locally. Single
+       user by definition, and never a security decision, because a local
+       server has no other tenants to leak to.
     """
-    return _header(IDENTITY_HEADER) or DEFAULT_USER_ID
+    asserted = _header(APP_USER_HEADER)
+    if asserted and APP_SHARED_SECRET:
+        offered = _header(APP_SECRET_HEADER) or ""
+        # compare_digest, not ==, so a wrong secret cannot be discovered one
+        # character at a time by timing the response.
+        if secrets.compare_digest(offered, APP_SHARED_SECRET):
+            return asserted.strip().lower(), "trusted app"
+
+    if email := _header(EMAIL_HEADER):
+        return email.strip().lower(), "gateway"
+
+    return DEFAULT_USER_ID, "unauthenticated"
+
+
+def current_user_id() -> str:
+    """The identity every read and write is scoped to."""
+    return identity()[0]
 
 
 @mcp.tool
@@ -292,12 +340,12 @@ def whoami() -> dict[str, Any]:
     almost always that the request arrived unauthenticated and landed in the
     shared local bucket.
     """
-    user_id = current_user_id()
+    user_id, source = identity()
     scoped = user_id != DEFAULT_USER_ID
     return {
         "ok": True,
         "user_id": user_id,
-        "email": _header(EMAIL_HEADER),
+        "identified_by": source,
         "scoped": scoped,
         "note": (
             "Expenses are scoped to this user; nobody else can read them."

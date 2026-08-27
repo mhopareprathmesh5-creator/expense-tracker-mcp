@@ -20,3 +20,7 @@ CLAUDE.md
 .env
 .env.*
 !.env.example
+
+# Streamlit's OIDC config: holds the Google client secret and the cookie
+# signing key. secrets.toml.example is committed to document the shape.
+.streamlit/secrets.toml

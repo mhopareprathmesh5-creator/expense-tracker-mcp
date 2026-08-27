@@ -69,17 +69,26 @@ class LoopThread:
         return asyncio.run_coroutine_threadsafe(coro, self.loop).result()
 
 
+@st.cache_resource
+def get_loop() -> LoopThread:
+    """One event loop for the whole app, shared by every signed-in user."""
+    return LoopThread()
+
+
 @st.cache_resource(show_spinner="Connecting to the expense server...")
-def get_runtime() -> tuple[LoopThread, AgentRuntime]:
-    """Build the loop and the agent once, and reuse them across every rerun.
+def get_runtime(email: str) -> AgentRuntime:
+    """Build one agent per signed-in user, and reuse it across reruns.
 
     `@st.cache_resource` is what makes this work: it caches the *object*, not
-    a copy of it, and survives reruns. Without it every keystroke would open a
-    new MCP session and a new database connection.
+    a copy, and survives reruns. Without it every keystroke would open a new
+    MCP session and a new database connection.
+
+    Keyed by email, so each user gets a session whose requests carry their own
+    identity. That costs one MCP session and one Postgres connection per
+    active user, which is fine at this scale and would need pooling at a
+    larger one.
     """
-    loop_thread = LoopThread()
-    runtime = loop_thread.run(AgentRuntime(remote=REMOTE).start())
-    return loop_thread, runtime
+    return get_loop().run(AgentRuntime(remote=REMOTE, as_user=email).start())
 
 
 def stream_turn(
@@ -133,7 +142,29 @@ def render_trace(container: Any, calls: list[dict]) -> None:
                 st.markdown(f"← {call['summary']}")
 
 
-loop_thread, runtime = get_runtime()
+# --------------------------------------------------------------------------
+# Sign-in gate
+# --------------------------------------------------------------------------
+#
+# Everything below this point requires a signed-in user, because without one
+# there is no identity to scope expenses by -- and defaulting to "show me
+# something" would mean showing one person's ledger to whoever opened the URL.
+if not st.user.is_logged_in:
+    st.title("💸 Expense Tracker")
+    st.markdown(
+        "Track expenses by talking to them. Sign in to keep a private ledger — "
+        "your expenses are visible only to you."
+    )
+    st.button("Sign in with Google", on_click=st.login, type="primary")
+    st.stop()
+
+user_email = (st.user.email or "").strip().lower()
+if not user_email:
+    st.error("Signed in, but Google did not share an email address.")
+    st.stop()
+
+loop_thread = get_loop()
+runtime = get_runtime(user_email)
 
 # The thread id lives in the URL, not in st.session_state, because
 # session_state is wiped by a browser refresh -- which would send you back to
@@ -154,16 +185,25 @@ with st.sidebar:
     st.caption("A LangGraph agent talking to a remote MCP server.")
 
     st.markdown(
-        f"**Signed in as**  \n`{runtime.email or runtime.user_id}`\n\n"
+        f"**Signed in as**  \n`{runtime.user_id}`\n\n"
         f"**Server**  \n`{runtime.url}`\n\n"
         f"**Model**  \n`{MODEL}`\n\n"
         f"**Tools**  \n" + "  \n".join(f"`{t.name}`" for t in runtime.tools)
     )
-    if runtime.user_id == "default":
-        st.warning(
-            "Unauthenticated — expenses go to the shared local bucket.",
-            icon="⚠️",
+
+    # The server is the authority on who you are, not the browser session. If
+    # these disagree, the asserted identity was not accepted and expenses
+    # would land in the wrong ledger -- worth failing loudly rather than
+    # quietly writing to somebody else's rows.
+    if runtime.user_id != user_email:
+        st.error(
+            f"Signed in as {user_email}, but the server sees "
+            f"`{runtime.user_id}` (via {runtime.identified_by}). "
+            "Check APP_SHARED_SECRET matches on both sides.",
+            icon="🚨",
         )
+
+    st.button("Sign out", on_click=st.logout, use_container_width=True)
 
     # Every stored conversation, read back from the checkpoint tables --
     # including ones started in the terminal client, since both front-ends
