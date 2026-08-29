@@ -342,11 +342,28 @@ def whoami() -> dict[str, Any]:
     """
     user_id, source = identity()
     scoped = user_id != DEFAULT_USER_ID
+
+    # Enough to diagnose a rejected assertion without revealing anything: does
+    # the server have a secret at all, did the app headers arrive, and did the
+    # secret match? A "no" to the second means the gateway dropped them; a
+    # "no" to the first or third is a configuration mismatch.
+    offered = _header(APP_SECRET_HEADER)
+    assertion = {
+        "server_has_secret": bool(APP_SHARED_SECRET),
+        "app_user_header_arrived": _header(APP_USER_HEADER) is not None,
+        "app_secret_header_arrived": offered is not None,
+        "secret_matched": bool(
+            offered and APP_SHARED_SECRET
+            and secrets.compare_digest(offered, APP_SHARED_SECRET)
+        ),
+    }
+
     return {
         "ok": True,
         "user_id": user_id,
         "identified_by": source,
         "scoped": scoped,
+        "assertion": assertion,
         "note": (
             "Expenses are scoped to this user; nobody else can read them."
             if scoped

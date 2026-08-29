@@ -155,7 +155,15 @@ if not st.user.is_logged_in:
         "Track expenses by talking to them. Sign in to keep a private ledger — "
         "your expenses are visible only to you."
     )
-    st.button("Sign in with Google", on_click=st.login, type="primary")
+    # "google" selects the [auth.google] section of secrets.toml. Calling
+    # st.login() with no argument looks for a *default* provider configured
+    # directly under [auth], which is not how the secrets file is laid out.
+    st.button(
+        "Sign in with Google",
+        on_click=st.login,
+        args=("google",),
+        type="primary",
+    )
     st.stop()
 
 user_email = (st.user.email or "").strip().lower()
