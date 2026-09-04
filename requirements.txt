@@ -1,0 +1,24 @@
+# For Streamlit Community Cloud, which builds from requirements.txt and does
+# not read PEP 735 [dependency-groups] out of pyproject.toml.
+#
+# This is the `ui` group: what app.py needs, and nothing more. The server's own
+# dependencies (fastmcp, asyncpg) are deliberately absent -- the deployed UI
+# talks to the MCP server over HTTP and never imports main.py.
+#
+# Local development still uses uv and the groups in pyproject.toml:
+#   uv sync --group ui
+# Keep the two in step when adding a dependency.
+
+streamlit>=1.62.0
+
+langchain>=1.3.16
+langchain-google-genai>=4.3.5
+langchain-mcp-adapters>=0.3.2
+langgraph>=1.2.11
+
+# Conversation history in Postgres. psycopg, not asyncpg: the LangGraph
+# checkpointer is built on psycopg, while the MCP server uses asyncpg.
+langgraph-checkpoint-postgres>=3.1.2
+psycopg[binary,pool]>=3.3.4
+
+python-dotenv>=1.2.2
