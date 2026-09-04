@@ -28,6 +28,7 @@ loop each time and kills the session bound to it.
 from __future__ import annotations
 
 import asyncio
+import os
 import queue
 import threading
 import uuid
@@ -36,6 +37,15 @@ from typing import Any, Iterator
 import streamlit as st
 
 from agent import CURRENCY, MODEL, AgentRuntime, use_selector_event_loop
+
+# Locally these come from `.env`; on Streamlit Cloud there is no .env and they
+# are supplied through the platform's secrets. `agent.py` reads os.environ so
+# that the terminal client and the UI share one way of finding credentials, so
+# bridge the platform's secrets into the environment here rather than teaching
+# agent.py about Streamlit.
+for _key in ("DATABASE_URL", "GOOGLE_API_KEY", "HORIZON_API_KEY", "APP_SHARED_SECRET"):
+    if not os.environ.get(_key) and _key in st.secrets:
+        os.environ[_key] = str(st.secrets[_key])
 
 # Talk to the deployed server, so there is no second terminal to remember.
 # Set to False to use a local `uv run python main.py http` instead.
