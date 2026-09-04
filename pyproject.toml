@@ -28,3 +28,14 @@ ui = [
     { include-group = "client" },
     "streamlit>=1.62.0",
 ]
+
+[tool.uv]
+# Streamlit Community Cloud installs with `uv sync` against uv.lock, and
+# `uv sync` installs only default groups -- so without this the deployed app
+# starts with none of its dependencies and dies on `import psycopg`.
+#
+# The cost is real and accepted: Horizon now installs the UI packages into the
+# server image too, which it never imports. A slower server build is a better
+# trade than a second dependency file that drifts, and the alternative (a
+# requirements.txt) was silently ignored because uv.lock takes precedence.
+default-groups = ["ui"]
