@@ -26,7 +26,6 @@ from pathlib import Path
 from typing import Any, AsyncIterator
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
-import psycopg
 from dotenv import load_dotenv
 from langchain.agents import create_agent
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
@@ -35,6 +34,7 @@ from langchain_mcp_adapters.client import MultiServerMCPClient
 from langchain_mcp_adapters.tools import load_mcp_tools
 from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 from psycopg.rows import dict_row
+from psycopg_pool import AsyncConnectionPool
 
 HERE = Path(__file__).parent
 load_dotenv(HERE / ".env")
@@ -256,7 +256,7 @@ class AgentRuntime:
         self.user_id = "default"
         self.identified_by = "unknown"
         self._stack = AsyncExitStack()
-        self._conn: psycopg.AsyncConnection | None = None
+        self._pool: AsyncConnectionPool | None = None
 
     def thread_key(self, name: str) -> str:
         """Namespace a conversation by its owner.
@@ -270,18 +270,39 @@ class AgentRuntime:
         return f"{self.user_id}:{name}"
 
     async def start(self) -> AgentRuntime:
-        self._conn = await psycopg.AsyncConnection.connect(
+        # A pool, not a single connection, because this object outlives its
+        # connections. Neon's free tier scales the compute to zero after a
+        # period of inactivity, which drops every open connection; the web UI
+        # holds a runtime in cache for as long as the app is up, so a lone
+        # connection eventually goes stale and every later request fails with
+        # `psycopg.OperationalError: the connection is closed`.
+        #
+        # `check` is the part that fixes it: the pool tests a connection
+        # before handing it out and quietly replaces a dead one. Without it a
+        # pool merely holds several stale connections instead of one.
+        self._pool = AsyncConnectionPool(
             checkpointer_dsn(),
-            autocommit=True,
-            # Neon's pooled endpoint is PgBouncer in transaction mode, handing
-            # a different backend to each transaction, so a statement prepared
-            # on one connection is missing on the next. Left on, this fails
-            # intermittently after appearing to work -- the worst failure mode.
-            prepare_threshold=None,
-            # The saver reads checkpoint rows as mappings and fails without it.
-            row_factory=dict_row,
+            min_size=1,
+            max_size=4,
+            kwargs={
+                "autocommit": True,
+                # Neon's pooled endpoint is PgBouncer in transaction mode,
+                # handing a different backend to each transaction, so a
+                # statement prepared on one connection is missing on the next.
+                # Left on, this fails intermittently after appearing to
+                # work -- the worst failure mode.
+                "prepare_threshold": None,
+                # The saver reads checkpoint rows as mappings.
+                "row_factory": dict_row,
+            },
+            check=AsyncConnectionPool.check_connection,
+            # Opening inside the constructor is deprecated; open explicitly so
+            # the first failure surfaces here rather than on first query.
+            open=False,
         )
-        checkpointer = AsyncPostgresSaver(self._conn)
+        await self._pool.open(wait=True, timeout=30)
+
+        checkpointer = AsyncPostgresSaver(self._pool)
         # Idempotent: creates the checkpoint tables on first run, no-ops after.
         # They sit alongside `expenses`, which is untouched.
         await checkpointer.setup()
@@ -314,8 +335,8 @@ class AgentRuntime:
 
     async def aclose(self) -> None:
         await self._stack.aclose()
-        if self._conn is not None:
-            await self._conn.close()
+        if self._pool is not None:
+            await self._pool.close()
 
     async def run_turn(self, text: str, thread_id: str) -> AsyncIterator[dict]:
         """Stream one turn as structured events.
@@ -357,18 +378,20 @@ class AgentRuntime:
         so the list is whatever is actually stored -- including conversations
         started from the terminal client.
         """
-        if self._conn is None:
+        if self._pool is None:
             return []
         prefix = f"{self.user_id}:"
-        cursor = await self._conn.execute(
-            "SELECT thread_id, max(checkpoint_id::text) AS newest "
-            "FROM checkpoints WHERE thread_id LIKE %s "
-            "GROUP BY thread_id ORDER BY newest DESC",
-            (prefix + "%",),
-        )
-        return [
-            row["thread_id"][len(prefix) :] for row in await cursor.fetchall()
-        ]
+        # Borrow a connection for the query and give it straight back, so a
+        # stale one gets replaced by the pool rather than cached by us.
+        async with self._pool.connection() as conn:
+            cursor = await conn.execute(
+                "SELECT thread_id, max(checkpoint_id::text) AS newest "
+                "FROM checkpoints WHERE thread_id LIKE %s "
+                "GROUP BY thread_id ORDER BY newest DESC",
+                (prefix + "%",),
+            )
+            rows = await cursor.fetchall()
+        return [row["thread_id"][len(prefix) :] for row in rows]
 
     async def history(self, thread_id: str) -> list[dict]:
         """Replay a stored conversation from the checkpointer.
