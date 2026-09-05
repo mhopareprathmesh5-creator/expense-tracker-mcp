@@ -1,21 +1,27 @@
 # expense-tracker-mcp
 
+**[Try it →](https://expense-tracker-mcp.streamlit.app)**  ·  sign in with
+Google; your expenses are private to you
+
 A remote [MCP](https://modelcontextprotocol.io) server for tracking personal
-expenses, backed by Postgres, designed to be driven by **two different
-clients**: Claude as a connector, and a custom LangGraph agent.
+expenses, backed by Postgres, driven by **three different clients**: Claude as
+a connector, a terminal agent, and a web app.
 
 Log an expense by saying "spent 450 on groceries today", then ask "what did I
-spend on food this month?" — and get the same answer from either client,
-because the state lives in a database rather than in a chat session.
+spend on food this month?" — and get the same answer from any of them, because
+the state lives in a database rather than in a chat session.
 
 ```
 Claude (connector) ──┐
                      │
-Streamlit UI ──┐     ├─► expense-tracker-mcp ─► Neon Postgres
-               ├─────┘        (FastMCP)
-Terminal REPL ─┘
+Streamlit web app ─┐ ├─► expense-tracker-mcp ─► Neon Postgres
+                   ├─┘        (FastMCP)
+Terminal REPL ─────┘
    (one LangGraph agent, two front-ends)
 ```
+
+Every query is scoped to the authenticated user, so several people share the
+deployment without sharing a ledger.
 
 ## Status
 
@@ -25,10 +31,11 @@ Terminal REPL ─┘
 | 2 | LangGraph client — terminal, agent loop, checkpointed memory | **done** |
 | 3 | Streamlit frontend on top of the working agent | **done** |
 | 4 | Queries scoped to the authenticated user | **done** |
+| 5 | Google sign-in, so the web app is multi-user too | **done** |
 
-The server is deployed and driven by both clients. Every claim above was
-verified by checking what actually landed in Postgres, not by reading what the
-model said it did.
+All five are deployed and in use. Every claim was verified by checking what
+actually landed in Postgres, not by reading what the model said it did — the
+`id` sequence is a useful receipt here, since rejected input never advances it.
 
 ## Tools
 
@@ -110,6 +117,9 @@ server does not.
 
 ## The web UI
 
+**Live at [expense-tracker-mcp.streamlit.app](https://expense-tracker-mcp.streamlit.app)** —
+sign in with Google and you get your own private ledger.
+
 [`app.py`](app.py) is a Streamlit chat interface over the same agent — same
 prompt, same tools, same conversation memory, because both front-ends build
 their runtime from [`agent.py`](agent.py) rather than each assembling one.
@@ -132,9 +142,46 @@ results. Reruns redraw the page and cannot disturb the connections.
 The conversation id lives in the **URL**, not in `st.session_state` — session
 state is wiped by a browser refresh, which would drop you back into the
 default conversation at precisely the moment persistence is supposed to prove
-itself. The sidebar lists every stored conversation, read back from the
+itself. The sidebar lists your stored conversations, read back from the
 checkpoint tables, so conversations started in the terminal client appear
 there too.
+
+### How the web app knows who you are
+
+This is the interesting part, because a web app cannot authenticate to the MCP
+server the way Claude does.
+
+Each Claude user makes their **own** connection, so the gateway sees a distinct
+caller and can identify each one. The web app is one program with one API key
+serving many people — the gateway sees a single caller and never learns the
+humans exist. Keeping track of them is the app's job.
+
+So the app signs users in with Google, then tells the server whose request each
+one is:
+
+```
+POST /mcp
+Authorization: Bearer <the app's API key>    may this caller connect?     yes
+x-app-secret:  <shared secret>               is this really my app?       yes
+x-app-user:    alice@gmail.com               whose expense is this?    Alice's
+```
+
+The key opens the door; the label on the request decides whose row it becomes.
+
+**The secret is what makes the label trustworthy.** `x-app-user` is only text —
+without proof of who wrote it, anyone holding an API key could name any user
+and read their expenses. The server accepts an asserted identity *only* when
+the shared secret matches, verified with `secrets.compare_digest` so a wrong
+value cannot be found one character at a time by timing. If the secret is
+unset, the path is disabled rather than open, and the app shows an error banner
+when the server disagrees with the browser session — it fails loudly instead of
+quietly writing to the wrong ledger.
+
+Identity is keyed on **email**, because two doors reach the same person: Claude
+gives a gateway UUID, Google gives a Google subject. Keyed on ids, one human
+would own two unrelated ledgers. The tradeoff is that emails are mutable, so
+changing yours orphans your history — fine here, wrong for a bank, where you
+would keep an immutable id and a separate email column.
 
 ## Running it locally
 
@@ -142,7 +189,7 @@ there too.
 [Neon](https://neon.tech) account (the free tier is enough).
 
 ```bash
-git clone https://github.com/<your-username>/expense-tracker-mcp
+git clone https://github.com/mhopareprathmesh5-creator/expense-tracker-mcp
 cd expense-tracker-mcp
 uv sync
 ```
@@ -186,18 +233,51 @@ A browser `GET` on `/mcp` returns **406 Not Acceptable**. That's correct, not a
 failure — MCP requires `POST` with
 `Accept: application/json, text/event-stream`.
 
+**To run the web app**, add Google sign-in credentials as well:
+
+```bash
+cp .streamlit/secrets.toml.example .streamlit/secrets.toml
+uv run --group ui streamlit run app.py
+```
+
+Fill in a Google OAuth client id and secret (Google Cloud → *Google Auth
+Platform* → *Clients* → Web application), with
+`http://localhost:8501/oauth2callback` as an authorized redirect URI — Google
+refuses to send users anywhere not registered in advance, which is what
+`redirect_uri_mismatch` means. `APP_SHARED_SECRET` in `.env` must match the
+value set on the server, or the server ignores the app's claim about who is
+signed in and everyone falls back to one ledger.
+
 ## Deploying
 
-Built for [Prefect Horizon](https://horizon.prefect.io) (formerly FastMCP
-Cloud). Point it at this repo with entrypoint `main.py:mcp` and set
-`DATABASE_URL` in the environment variables. Deployed servers get a
-`*.fastmcp.app` URL, which can be added directly to Claude as a connector.
+**The server** runs on [Prefect Horizon](https://horizon.prefect.io) (formerly
+FastMCP Cloud). Point it at this repo with entrypoint `main.py:mcp` and set
+`DATABASE_URL` and `APP_SHARED_SECRET` in its environment variables. Deployed
+servers get a `*.fastmcp.app` URL, which can be added directly to Claude as a
+connector.
 
-Note there is deliberately **no `.python-version` file**. Horizon builds with
-`UV_PROJECT_ENVIRONMENT=/usr/local`, a system Python prefix rather than a
-virtualenv; a version pin makes uv reject it, download a managed CPython, and
-fail trying to recreate a non-venv directory. The `requires-python = ">=3.10"`
-floor in `pyproject.toml` is sufficient.
+Horizon reads environment variables at **container start**, so adding one is
+not enough — the app must be redeployed, or it keeps running with the old
+value. An unset `APP_SHARED_SECRET` looks identical to a wrong one from the
+outside, which is why `whoami` reports whether the server has a secret, whether
+the headers arrived, and whether they matched.
+
+**The web app** runs on [Streamlit Community Cloud](https://share.streamlit.io),
+deployed from the same repo with `app.py` as the entry point. Its secrets hold
+the `[auth]` blocks plus `DATABASE_URL`, `GOOGLE_API_KEY`, `HORIZON_API_KEY`
+and `APP_SHARED_SECRET`, and `redirect_uri` must point at the deployed URL and
+be registered with Google.
+
+Two deployment notes worth knowing:
+
+- Streamlit installs with `uv sync` against `uv.lock`, and **`uv sync` installs
+  only default groups** — hence `default-groups = ["ui"]` in `pyproject.toml`.
+  A `requirements.txt` is silently ignored, because `uv.lock` takes precedence.
+- There is deliberately **no `.python-version` file**. Horizon builds with
+  `UV_PROJECT_ENVIRONMENT=/usr/local`, a system Python prefix rather than a
+  virtualenv; a version pin makes uv reject it, download a managed CPython, and
+  fail trying to recreate a non-venv directory. The
+  `requires-python = ">=3.10"` floor is sufficient.
 
 ## Design decisions
 
@@ -226,7 +306,7 @@ caller to type-check before using the result.
 
 **Every query is scoped to the authenticated user, and there is one place it
 can go wrong.** Prefect Horizon terminates auth at its edge and forwards the
-identity in `horizon-user-id`; the server reads it in `current_user_id()`.
+identity in headers; the server resolves it in `current_user_id()`.
 Reads go through a single helper that always emits `user_id = $1`, so no tool
 builds its own `WHERE` clause and none can forget the filter. `delete_expense`
 scopes in the `DELETE` itself rather than checking ownership first — one
@@ -262,6 +342,16 @@ transaction, so a statement prepared on one connection is missing on the next.
 appearing to work, which is a much worse failure than one that shows up
 immediately.
 
+**The checkpointer uses a pool that checks connections before lending them.**
+Neon's free tier suspends the compute after inactivity, dropping every open
+connection — and the web app caches a runtime for as long as it is up, so a
+single held connection eventually goes stale and every later request fails with
+`the connection is closed`. It presents as one account being broken, because it
+hits whoever has been idle longest. `AsyncConnectionPool` with
+`check=check_connection` tests a connection before handing it out and replaces
+a dead one. The `check` is the load-bearing part: a pool without it just holds
+several stale connections instead of one.
+
 **The client sets a selector event loop on Windows.** psycopg's async mode
 refuses to run on `ProactorEventLoop`, the Windows default; asyncio
 subprocesses on Windows run *only* on `ProactorEventLoop`. A stdio MCP
@@ -278,25 +368,29 @@ Honest limitations rather than oversights:
   an amount means deleting and re-logging.
 - **No currency column.** Every amount is assumed to be in one currency; the
   client is told they are rupees.
-- **The web UI is single-user.** The server scopes by authenticated user, but
-  `app.py` holds one API key, so every browser visitor acts as its owner. Real
-  per-user identity applies to people connecting with their own accounts — a
-  Claude connector, or their own key. Making the UI multi-user needs its own
-  login, which is a different piece of work.
 - **No long-term memory.** The agent remembers a conversation, not facts across
   conversations. Those are genuinely different features and only the first is
   built.
+- **The web app trusts itself.** The server believes an asserted user because
+  the caller holds a shared secret. That is the standard backend-for-frontend
+  arrangement, and it means the app is a trusted component: anyone who obtained
+  both the API key and the secret could impersonate any user. A stricter design
+  would have each browser user authenticate to the server directly.
+- **Free-tier realities.** The database suspends when idle, so the first
+  request after a quiet spell is slow, and one shared API key funds every
+  user's model calls.
 
 ## Layout
 
 ```
-main.py           the server: four tools, one resource
-agent.py          the agent: MCP session, checkpointer, model, prompt
-client.py         terminal front-end
-app.py            Streamlit front-end
-schema.sql        one-time table + index creation
-categories.json   the category taxonomy, single source of truth
-.env.example      documents every variable all three need
+main.py                        the server: six tools, one resource
+agent.py                       the agent: MCP session, checkpointer, prompt
+client.py                      terminal front-end
+app.py                         Streamlit front-end, with Google sign-in
+schema.sql                     one-time table + index creation
+categories.json                the category taxonomy, single source of truth
+.env.example                   documents every variable all three need
+.streamlit/secrets.toml.example  the shape of the Google sign-in config
 ```
 
 ## Built with
