@@ -45,6 +45,7 @@ actually landed in Postgres, not by reading what the model said it did — the
 | `list_categories` | The valid taxonomy, so the model can look it up instead of guessing. |
 | `add_expense` | Record one expense. Validates the category before writing. |
 | `list_expenses` | Individual rows, newest first. Optional date range and category filters. |
+| `edit_expense` | Change any field of one expense. Only what you pass is touched. |
 | `delete_expense` | Remove one expense by id. Scoped to the owner. |
 | `summarize` | Totals over a date range, grouped by category — or by subcategory when you filter to one category. |
 
@@ -319,6 +320,15 @@ this step would be a change of value rather than a migration. It is
 deliberately *not* a tool parameter: if the model could choose it, any client
 could read anyone's expenses just by asking.
 
+`edit_expense` is the one place that has to read before it writes, because a
+partial edit cannot be validated otherwise — changing only a subcategory means
+checking it against the category already stored. Both statements carry the
+`user_id` filter, so the write is scoped on its own rather than trusting the
+read that preceded it. It also drops any field already equal to what is
+stored, so the result names only what genuinely changed; otherwise editing a
+subcategory would report the category as changed too, and the model would
+repeat that back to the user.
+
 **Header-based identity is only sound if headers cannot be forged**, so that
 was tested rather than assumed: sending `horizon-user-id: 00000000-dead-beef-…`
 from a client, the gateway overwrote it and the server still saw the real
@@ -364,8 +374,6 @@ exists on Linux or macOS.
 
 Honest limitations rather than oversights:
 
-- **No edit tool.** You can add and delete, but not amend in place; correcting
-  an amount means deleting and re-logging.
 - **No currency column.** Every amount is assumed to be in one currency; the
   client is told they are rupees.
 - **No long-term memory.** The agent remembers a conversation, not facts across

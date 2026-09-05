@@ -140,9 +140,10 @@ mcp = FastMCP(
         "exact cents. `add_expense` needs the date the money was spent in "
         "YYYY-MM-DD form -- pass the user's local date rather than assuming "
         "the server's.\n\n"
-        "`delete_expense` is permanent. Find the id with `list_expenses` and "
-        "confirm which row the user means before deleting; never guess an id "
-        "from a description."
+        "`edit_expense` changes only the fields you pass. `delete_expense` is "
+        "permanent. For both, find the id with `list_expenses` and confirm "
+        "which row the user means; never guess an id from a description. "
+        "Prefer editing over delete-and-re-add when correcting a mistake."
     ),
 )
 
@@ -488,6 +489,115 @@ async def list_expenses(
         "ok": True,
         "count": len(rows),
         "expenses": [_row_to_expense(r) for r in rows],
+    }
+
+
+@mcp.tool(annotations={"idempotentHint": True})
+async def edit_expense(
+    expense_id: Annotated[
+        int, Field(gt=0, description="id of the expense to change, from list_expenses.")
+    ],
+    date: Annotated[
+        Date | None, Field(description="New date the money was spent, YYYY-MM-DD.")
+    ] = None,
+    amount: Annotated[
+        Decimal | None, Field(gt=0, description="New amount. Must be greater than zero.")
+    ] = None,
+    category: Annotated[str | None, Field(description="New top-level category.")] = None,
+    subcategory: Annotated[
+        str | None, Field(description="New subcategory, or empty string to clear it.")
+    ] = None,
+    note: Annotated[
+        str | None, Field(description="New note, or empty string to clear it.")
+    ] = None,
+) -> dict[str, Any]:
+    """Change one or more fields of an existing expense.
+
+    Only the fields you pass are changed; everything else is left alone. Use
+    `list_expenses` to find the id, and confirm which row the user means before
+    editing.
+    """
+    user_id = current_user_id()
+    pool = await get_pool()
+
+    # Read the row first, because a partial edit cannot be validated without
+    # the current values: changing only the subcategory means checking it
+    # against the category already stored. The read is scoped, so an id
+    # belonging to someone else looks exactly like one that does not exist.
+    current = await pool.fetchrow(
+        "SELECT id, date, amount, category, subcategory, note "
+        "FROM expenses WHERE id = $1 AND user_id = $2",
+        expense_id,
+        user_id,
+    )
+    if current is None:
+        return {"ok": False, "error": f"No expense #{expense_id} in your records."}
+
+    new_category = category if category is not None else current["category"]
+    new_subcategory = (
+        subcategory if subcategory is not None else current["subcategory"]
+    )
+    if category is not None or subcategory is not None:
+        new_category, new_subcategory, error = _validate_category(
+            new_category, new_subcategory
+        )
+        if error:
+            return error
+
+    updates: dict[str, Any] = {}
+    if date is not None:
+        updates["date"] = date
+    if amount is not None:
+        try:
+            amt = Decimal(amount).quantize(Decimal("0.01"))
+        except (InvalidOperation, TypeError):
+            return {"ok": False, "error": f"Could not read {amount!r} as an amount."}
+        if amt <= 0:
+            return {"ok": False, "error": "Amount must be greater than zero."}
+        updates["amount"] = amt
+    if category is not None or subcategory is not None:
+        updates["category"] = new_category
+        updates["subcategory"] = new_subcategory
+    if note is not None:
+        updates["note"] = note.strip()
+
+    # Drop anything already equal to what is stored. Changing a subcategory
+    # alone sets `category` too (it has to, to validate the pair), and without
+    # this the result would claim the category changed when it did not -- and
+    # the model would repeat that claim back to the user.
+    updates = {k: v for k, v in updates.items() if v != current[k]}
+
+    if not updates:
+        return {
+            "ok": True,
+            "expense": _row_to_expense(current),
+            "changed": [],
+            "note": "Nothing to change -- the values given match what is stored.",
+        }
+
+    # The WHERE clause repeats `user_id` even though the row was already read
+    # under it. Re-reading and then writing is two statements, and only the
+    # one that writes decides what is written -- so it carries the scope too.
+    args: list[Any] = list(updates.values())
+    assignments = ", ".join(f"{col} = ${i}" for i, col in enumerate(updates, start=1))
+    args += [expense_id, user_id]
+
+    row = await pool.fetchrow(
+        f"""
+        UPDATE expenses SET {assignments}
+        WHERE id = ${len(args) - 1} AND user_id = ${len(args)}
+        RETURNING id, date, amount, category, subcategory, note
+        """,
+        *args,
+    )
+    if row is None:  # deleted between the read and the write
+        return {"ok": False, "error": f"No expense #{expense_id} in your records."}
+
+    log.info("edited expense id=%s user=%s fields=%s", row["id"], user_id, [*updates])
+    return {
+        "ok": True,
+        "expense": _row_to_expense(row),
+        "changed": sorted(updates),
     }
 
 

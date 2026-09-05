@@ -216,8 +216,9 @@ def brief(payload: dict) -> str:
         return f"rejected: {payload.get('error', '?')}"
     if "expense" in payload:
         e = payload["expense"]
+        verb = "updated" if "changed" in payload else "saved"
         return (
-            f"saved #{e['id']} {e['amount']} "
+            f"{verb} #{e['id']} {e['amount']} "
             f"{e['category']}/{e['subcategory'] or '-'} on {e['date']}"
         )
     if "deleted" in payload:
